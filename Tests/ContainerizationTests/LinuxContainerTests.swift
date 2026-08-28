@@ -15,8 +15,11 @@
 //===----------------------------------------------------------------------===//
 
 import ContainerizationOCI
+import ContainerizationOS
 import Foundation
 import Testing
+
+import struct ContainerizationOCI.ImageConfig
 
 @testable import Containerization
 
@@ -65,5 +68,106 @@ struct LinuxContainerTests {
         let process = LinuxProcessConfiguration(from: imageConfig)
 
         #expect(process.arguments == ["/bin/sh", "-c", "echo 'hello'", "&&", "sleep 10"])
+    }
+
+    @Test func defaultCapabilitiesAreRestrictedOCISet() {
+        // Regression guard against shipping `.allCapabilities` as the default.
+        // A default container must not receive CAP_SYS_ADMIN, which would let it
+        // write /proc/sys/kernel/core_pattern and escape to guest-root. Cover both
+        // construction paths: the no-argument init (property default) and the full
+        // memberwise init (parameter default).
+        let viaProperty = LinuxProcessConfiguration()
+        let viaInit = LinuxProcessConfiguration(arguments: ["/bin/sh"])
+
+        for caps in [viaProperty.capabilities, viaInit.capabilities] {
+            for set in [caps.bounding, caps.effective, caps.permitted, caps.inheritable, caps.ambient] {
+                #expect(!set.contains(.sysAdmin), "default capabilities must not include CAP_SYS_ADMIN")
+            }
+        }
+
+        // The default must be exactly the documented OCI baseline.
+        let expected = LinuxCapabilities.defaultOCICapabilities
+        #expect(viaProperty.capabilities.bounding == expected.bounding)
+        #expect(viaProperty.capabilities.effective == expected.effective)
+        #expect(viaProperty.capabilities.permitted == expected.permitted)
+        #expect(viaProperty.capabilities.inheritable == expected.inheritable)
+        #expect(viaProperty.capabilities.ambient == expected.ambient)
+        #expect(viaInit.capabilities.bounding == expected.bounding)
+    }
+
+    @Test func defaultMaskedAndReadonlyPathsAreOCISet() {
+        // Regression guard: masked/readonly paths must default to the OCI
+        // standard set now that capabilities default to the restricted baseline.
+        // Without CAP_SYS_ADMIN a workload can't unmount these, so the defaults
+        // are meaningful defense-in-depth — shipping empty defaults would leave
+        // /proc/kcore and friends exposed. Cover both construction paths and
+        // both configuration types.
+        let expectedMasked = LinuxContainer.defaultMaskedPaths()
+        let expectedReadonly = LinuxContainer.defaultReadonlyPaths()
+
+        // Sensitive kernel paths must actually be in the defaults.
+        #expect(expectedMasked.contains("/proc/kcore"))
+        #expect(expectedMasked.contains("/sys/firmware"))
+        #expect(expectedReadonly.contains("/proc/sys"))
+
+        let containerViaProperty = LinuxContainer.Configuration()
+        let containerViaInit = LinuxContainer.Configuration(process: LinuxProcessConfiguration(arguments: ["/bin/sh"]))
+        let pod = LinuxPod.ContainerConfiguration()
+
+        for config in [containerViaProperty, containerViaInit] {
+            #expect(config.maskedPaths == expectedMasked)
+            #expect(config.readonlyPaths == expectedReadonly)
+        }
+        #expect(pod.maskedPaths == expectedMasked)
+        #expect(pod.readonlyPaths == expectedReadonly)
+    }
+
+    @Test func runtimeSpecIncludesConfiguredBlockIO() throws {
+        let blockIO = Containerization.LinuxBlockIO(
+            weight: 500,
+            leafWeight: 300,
+            weightDevice: [
+                Containerization.LinuxWeightDevice(major: 8, minor: 0, weight: 700, leafWeight: 400)
+            ],
+            throttleReadBpsDevice: [
+                Containerization.LinuxThrottleDevice(major: 8, minor: 16, rate: 1_048_576)
+            ],
+            throttleWriteBpsDevice: [
+                Containerization.LinuxThrottleDevice(major: 8, minor: 32, rate: 2_097_152)
+            ],
+            throttleReadIOPSDevice: [
+                Containerization.LinuxThrottleDevice(major: 8, minor: 48, rate: 1_000)
+            ],
+            throttleWriteIOPSDevice: [
+                Containerization.LinuxThrottleDevice(major: 8, minor: 64, rate: 2_000)
+            ]
+        )
+
+        let container = try LinuxContainer(
+            "blkio-test",
+            rootfs: .block(format: "ext4", source: "/tmp/rootfs.img", destination: "/"),
+            vmm: StubVirtualMachineManager(),
+            configuration: .init(process: .init(), blockIO: blockIO)
+        )
+
+        let resources = try #require(container.generateRuntimeSpec().linux?.resources)
+        let specBlockIO = try #require(resources.blockIO)
+
+        #expect(specBlockIO.weight == 500)
+        #expect(specBlockIO.leafWeight == 300)
+        #expect(specBlockIO.weightDevice.first?.major == 8)
+        #expect(specBlockIO.weightDevice.first?.minor == 0)
+        #expect(specBlockIO.weightDevice.first?.weight == 700)
+        #expect(specBlockIO.weightDevice.first?.leafWeight == 400)
+        #expect(specBlockIO.throttleReadBpsDevice.first?.rate == 1_048_576)
+        #expect(specBlockIO.throttleWriteBpsDevice.first?.rate == 2_097_152)
+        #expect(specBlockIO.throttleReadIOPSDevice.first?.rate == 1_000)
+        #expect(specBlockIO.throttleWriteIOPSDevice.first?.rate == 2_000)
+    }
+}
+
+private struct StubVirtualMachineManager: VirtualMachineManager {
+    func create(config: some VMCreationConfig) async throws -> any VirtualMachineInstance {
+        fatalError("StubVirtualMachineManager.create should not be called by LinuxContainerTests")
     }
 }
